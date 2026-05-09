@@ -2,3 +2,13 @@
 __pycache__/
 *.pyc
 .DS_Store
+rust_scorer/target/
+target/
+rust_scorer/target/
+target/
+
+rust_scorer/target/
+target/
+
+rust_scorer/target/
+target/

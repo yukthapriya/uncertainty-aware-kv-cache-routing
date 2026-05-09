@@ -1,13 +1,11 @@
 from __future__ import annotations
 
+import contextlib
+import logging
 import time
 import uuid
-from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import httpx
-import uvicorn
 import yaml
 from fastapi import FastAPI, HTTPException
 
@@ -16,286 +14,229 @@ from kv_router.metrics import RouterMetrics
 from kv_router.models import (
     GenerateRequest,
     GenerateResponse,
-    NodeInfo,
-    RoutingBreakdown,
+    NodeState,
     RoutingWeights,
+    RustScorerNodeInput,
+    RustScorerRequest,
+    RustScorerResponse,
 )
 from kv_router.node_registry import NodeRegistry
-from kv_router.scoring import build_score_breakdown
-from kv_router.uncertainty import UncertaintyEstimator, build_uncertainty_estimator
-
-import logging
+from kv_router.scoring import (
+    next_round_robin_index,
+    score_kv_aware,
+    score_least_loaded,
+    score_round_robin,
+)
+from kv_router.uncertainty import build_uncertainty_estimator
 
 configure_logging()
 logger = logging.getLogger(__name__)
 
-CONFIG_PATH = Path(__file__).with_name("config.yaml")
+with open("kv_router/config.yaml", "r", encoding="utf-8") as f:
+    CONFIG = yaml.safe_load(f)
+
+WEIGHTS = RoutingWeights(**CONFIG.get("scoring", {}))
+ROUTER_METRICS = RouterMetrics()
+UNCERTAINTY_ESTIMATOR = build_uncertainty_estimator(CONFIG)
+
+NODE_REGISTRY = NodeRegistry(
+    nodes=CONFIG["nodes"],
+    interval_s=CONFIG["polling"]["interval_s"],
+    stale_after_s=CONFIG["polling"]["stale_after_s"],
+    degrade_duration_s=CONFIG["polling"]["degrade_duration_s"],
+    timeout_s=CONFIG["timeouts"]["metrics_request_timeout_s"],
+)
+
+app = FastAPI(title="Uncertainty-Aware KV Router")
 
 
-class RouterState:
-    def __init__(
-        self,
-        *,
-        registry: NodeRegistry,
-        estimator: UncertaintyEstimator,
-        weights: RoutingWeights,
-        forward_timeout_s: float,
-        vllm_generate_path: str,
-        max_active_requests: int,
-        router_metrics: RouterMetrics,
-    ) -> None:
-        self.registry = registry
-        self.estimator = estimator
-        self.weights = weights
-        self.forward_timeout_s = forward_timeout_s
-        self.vllm_generate_path = vllm_generate_path
-        self.max_active_requests = max_active_requests
-        self.router_metrics = router_metrics
-        self.last_metrics: List[Dict[str, Any]] = []
+@app.on_event("startup")
+async def startup() -> None:
+    await NODE_REGISTRY.start()
 
 
-def load_router_settings(config_path: Path) -> Dict[str, Any]:
-    with config_path.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+@app.on_event("shutdown")
+async def shutdown() -> None:
+    await NODE_REGISTRY.stop()
 
 
-def build_app(config_path: Path = CONFIG_PATH) -> FastAPI:
-    config = load_router_settings(config_path)
+async def compute_ranked_scores(request: GenerateRequest, states: list[NodeState]):
+    uncertainty = UNCERTAINTY_ESTIMATOR.estimate(request.prompt, request.temperature)
 
-    registry = NodeRegistry(
-        config_path=config_path,
-        request_timeout_s=float(
-            (config.get("timeouts", {}) or {}).get("metrics_request_timeout_s", 2.0)
-        ),
-    )
-
-    uncertainty_config = config.get("uncertainty_estimator", {}) or {}
-    estimator = build_uncertainty_estimator(uncertainty_config)
-
-    scoring_config = config.get("scoring", {}) or {}
-    weights = RoutingWeights(
-        alpha=float(scoring_config.get("alpha", 1.0)),
-        beta=float(scoring_config.get("beta", 0.2)),
-        gamma=float(scoring_config.get("gamma", 0.8)),
-        delta=float(scoring_config.get("delta", 2.0)),
-    )
-
-    router_config = config.get("router", {}) or {}
-    forward_timeout_s = float(
-        (config.get("timeouts", {}) or {}).get("forward_request_timeout_s", 60.0)
-    )
-    vllm_generate_path = str(router_config.get("vllm_generate_path", "/generate"))
-    max_active_requests = int(router_config.get("max_active_requests", 16))
-
-    state = RouterState(
-        registry=registry,
-        estimator=estimator,
-        weights=weights,
-        forward_timeout_s=forward_timeout_s,
-        vllm_generate_path=vllm_generate_path,
-        max_active_requests=max_active_requests,
-        router_metrics=RouterMetrics(),
-    )
-
-    @asynccontextmanager
-    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        await state.registry.start()
-        await state.registry.refresh_all()
-        state.last_metrics = [n.model_dump() for n in await state.registry.get_nodes()]
-        try:
-            yield
-        finally:
-            await state.registry.stop()
-
-    app = FastAPI(
-        title="Uncertainty-Aware KV-Cache Router",
-        version="0.2.0",
-        lifespan=lifespan,
-    )
-    app.state.router_state = state
-
-    async def rank_nodes(uncertainty: float) -> List[RoutingBreakdown]:
-        await state.registry.refresh_all()
-        nodes = await state.registry.get_nodes()
-        state.last_metrics = [n.model_dump() for n in nodes]
-
-        ranked: List[RoutingBreakdown] = []
-        for node in nodes:
-            breakdown = build_score_breakdown(
-                node_url=node.url,
-                metrics=node.metrics.model_dump(),
+    if request.routing_strategy == "least_loaded":
+        ranked = [
+            score_least_loaded(
+                node=state,
+                max_active_requests=CONFIG["router"]["max_active_requests"],
                 uncertainty=uncertainty,
-                weights=state.weights,
-                max_active_requests=state.max_active_requests,
-                stale=node.stale,
-                healthy=node.healthy,
             )
+            for state in states
+        ]
+        ranked.sort(key=lambda s: s.score, reverse=True)
+        return ranked, uncertainty
+
+    if request.routing_strategy == "round_robin":
+        chosen_index = next_round_robin_index(len(states))
+        rotated_states = states[chosen_index:] + states[:chosen_index]
+
+        ranked = []
+        for i, state in enumerate(rotated_states):
+            breakdown = score_round_robin(
+                node=state,
+                ordered_nodes=rotated_states,
+                chosen_index=0,
+                uncertainty=uncertainty,
+            )
+            breakdown.score = float(len(rotated_states) - i)
             ranked.append(breakdown)
 
-        ranked.sort(key=lambda item: item.score, reverse=True)
-        return ranked
+        return ranked, uncertainty
 
-    async def try_forward(
-        candidate_nodes: List[RoutingBreakdown],
-        payload: Dict[str, Any],
-        request_id: str,
-    ) -> Tuple[str, Dict[str, Any], List[str], bool, float]:
-        tried_nodes: List[str] = []
-        used_fallback = False
+    rust_cfg = CONFIG.get("rust_scorer", {})
+    rust_enabled = rust_cfg.get("enabled", False)
+    rust_url = rust_cfg.get("url")
 
-        async with httpx.AsyncClient(timeout=state.forward_timeout_s) as client:
-            for idx, candidate in enumerate(candidate_nodes):
-                if not candidate.healthy:
-                    continue
-
-                tried_nodes.append(candidate.node_url)
-                target_url = (
-                    f"{candidate.node_url.rstrip('/')}/"
-                    f"{state.vllm_generate_path.lstrip('/')}"
-                )
-
-                upstream_started = time.perf_counter()
-                try:
-                    response = await client.post(
-                        target_url,
-                        json=payload,
-                        headers={"x-request-id": request_id},
-                    )
-                    response.raise_for_status()
-                    upstream_latency_ms = (time.perf_counter() - upstream_started) * 1000.0
-                    return (
-                        candidate.node_url,
-                        response.json(),
-                        tried_nodes,
-                        idx > 0,
-                        upstream_latency_ms,
-                    )
-                except httpx.HTTPError:
-                    await state.registry.mark_node_degraded(candidate.node_url)
-                    used_fallback = True
-                    logger.warning(
-                        "Upstream request failed; trying next node",
-                        extra={
-                            "extra_fields": {
-                                "request_id": request_id,
-                                "failed_node": candidate.node_url,
-                            }
-                        },
-                    )
-
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "message": "All candidate nodes failed",
-                "request_id": request_id,
-                "tried_nodes": tried_nodes,
-                "used_fallback": used_fallback,
-            },
-        )
-
-    @app.get("/health")
-    async def health() -> Dict[str, Any]:
-        nodes = await state.registry.get_nodes()
-        state.last_metrics = [n.model_dump() for n in nodes]
-        return {
-            "status": "ok",
-            "node_count": len(nodes),
-            "healthy_node_count": len([n for n in nodes if n.healthy]),
-            "weights": state.weights.model_dump(),
-            "router_metrics": state.router_metrics.snapshot(),
-            "last_known_metrics": state.last_metrics,
-        }
-
-    @app.get("/metrics/router")
-    async def router_metrics() -> Dict[str, Any]:
-        return state.router_metrics.snapshot()
-
-    @app.post("/generate", response_model=GenerateResponse)
-    async def generate(request: GenerateRequest) -> GenerateResponse:
-        request_id = str(uuid.uuid4())
-        router_started = time.perf_counter()
-
-        uncertainty = state.estimator.estimate(
-            prompt=request.prompt,
-            temperature=request.temperature,
-        )
-
-        ranked_nodes = await rank_nodes(uncertainty=uncertainty)
-        healthy_candidates = [node for node in ranked_nodes if node.healthy]
-
-        if not healthy_candidates:
-            state.router_metrics.record_failure()
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "message": "No healthy nodes available for routing",
-                    "request_id": request_id,
-                },
-            )
-
-        payload = {
-            "prompt": request.prompt,
-            "max_tokens": request.max_tokens,
-            "temperature": request.temperature,
-            "stream": request.stream,
-        }
-
+    if rust_enabled and rust_url:
         try:
-            selected_node, upstream_payload, tried_nodes, used_fallback, upstream_latency_ms = (
-                await try_forward(
-                    candidate_nodes=healthy_candidates,
-                    payload=payload,
-                    request_id=request_id,
-                )
+            rust_nodes = []
+            for state in states:
+                if state.metrics is None:
+                    rust_nodes.append(
+                        RustScorerNodeInput(
+                            node_url=state.url,
+                            kv_used_mb=0,
+                            kv_capacity_mb=1,
+                            active_requests=9999,
+                            healthy=state.healthy,
+                            stale=state.stale,
+                        )
+                    )
+                else:
+                    rust_nodes.append(
+                        RustScorerNodeInput(
+                            node_url=state.url,
+                            kv_used_mb=state.metrics.kv_used_mb,
+                            kv_capacity_mb=state.metrics.kv_capacity_mb,
+                            active_requests=state.metrics.active_requests,
+                            healthy=state.healthy,
+                            stale=state.stale,
+                        )
+                    )
+
+            rust_payload = RustScorerRequest(
+                uncertainty=uncertainty,
+                max_active_requests=CONFIG["router"]["max_active_requests"],
+                weights=WEIGHTS,
+                nodes=rust_nodes,
             )
-        except HTTPException:
-            state.router_metrics.record_failure()
-            raise
 
-        router_latency_ms = (time.perf_counter() - router_started) * 1000.0
-        state.router_metrics.record_success(
-            node_url=selected_node,
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.post(rust_url, json=rust_payload.model_dump())
+                response.raise_for_status()
+                rust_response = RustScorerResponse(**response.json())
+                return rust_response.ranked_nodes, uncertainty
+
+        except Exception as exc:
+            logger.warning("Rust scorer unavailable, falling back to Python scoring: %s", exc)
+
+    ranked = [
+        score_kv_aware(
+            node=state,
             uncertainty=uncertainty,
-            router_latency_ms=router_latency_ms,
-            upstream_latency_ms=upstream_latency_ms,
-            used_fallback=used_fallback,
+            weights=WEIGHTS,
+            max_active_requests=CONFIG["router"]["max_active_requests"],
+            prompt=request.prompt,
+            session_id=request.session_id,
+        )
+        for state in states
+    ]
+    ranked.sort(key=lambda s: s.score, reverse=True)
+    return ranked, uncertainty
+
+
+@app.get("/health")
+async def health():
+    states = NODE_REGISTRY.get_states()
+    return {
+        "status": "ok",
+        "node_count": len(states),
+        "healthy_node_count": sum(1 for s in states if s.healthy),
+        "weights": WEIGHTS.model_dump(),
+        "rust_scorer": CONFIG.get("rust_scorer", {}),
+        "router_metrics": ROUTER_METRICS.snapshot().model_dump(),
+        "last_known_metrics": [s.model_dump() for s in states],
+    }
+
+
+@app.get("/metrics/router")
+async def router_metrics():
+    return ROUTER_METRICS.snapshot().model_dump()
+
+
+@app.post("/generate", response_model=GenerateResponse)
+async def generate(request: GenerateRequest):
+    request_id = str(uuid.uuid4())
+    started = time.perf_counter()
+    states = NODE_REGISTRY.get_states()
+
+    if not any(s.healthy for s in states):
+        raise HTTPException(
+            status_code=503,
+            detail={"message": "No healthy nodes available for routing", "request_id": request_id},
         )
 
-        logger.info(
-            "Request routed successfully",
-            extra={
-                "extra_fields": {
-                    "request_id": request_id,
-                    "selected_node": selected_node,
-                    "tried_nodes": tried_nodes,
-                    "uncertainty": round(uncertainty, 6),
-                    "router_latency_ms": round(router_latency_ms, 3),
-                    "upstream_latency_ms": round(upstream_latency_ms, 3),
-                    "used_fallback": used_fallback,
-                }
-            },
+    ranked_scores, uncertainty = await compute_ranked_scores(request, states)
+    state_by_url = {s.url: s for s in states}
+
+    tried_nodes: list[str] = []
+    upstream_latency_ms = 0.0
+    upstream_response = None
+    selected_node = None
+
+    async with httpx.AsyncClient(timeout=CONFIG["timeouts"]["forward_request_timeout_s"]) as client:
+        for breakdown in ranked_scores:
+            candidate = state_by_url[breakdown.node_url]
+            if not candidate.healthy:
+                continue
+
+            tried_nodes.append(candidate.url)
+            try:
+                upstream_started = time.perf_counter()
+                response = await client.post(
+                    f"{candidate.url}{CONFIG['router']['vllm_generate_path']}",
+                    json=request.model_dump(),
+                )
+                response.raise_for_status()
+                upstream_latency_ms = (time.perf_counter() - upstream_started) * 1000.0
+                upstream_response = response.json()
+                selected_node = candidate.url
+                break
+            except Exception as exc:
+                logger.warning("Forwarding failed for node %s: %s", candidate.url, exc)
+                NODE_REGISTRY.mark_degraded(candidate.url)
+                ROUTER_METRICS.record_fallback()
+
+    if selected_node is None or upstream_response is None:
+        ROUTER_METRICS.record_failed_request()
+        raise HTTPException(
+            status_code=503,
+            detail={"message": "All candidate nodes failed during forwarding", "request_id": request_id},
         )
 
-        return GenerateResponse(
-            request_id=request_id,
-            selected_node=selected_node,
-            tried_nodes=tried_nodes,
-            uncertainty=uncertainty,
-            routing_scores=healthy_candidates,
-            router_metrics=state.router_metrics.snapshot(),
-            upstream_response=upstream_payload,
-        )
+    router_latency_ms = (time.perf_counter() - started) * 1000.0
+    ROUTER_METRICS.record_selection(selected_node)
+    ROUTER_METRICS.record_request(
+        uncertainty=uncertainty,
+        router_latency_ms=router_latency_ms,
+        upstream_latency_ms=upstream_latency_ms,
+    )
 
-    return app
-
-
-app = build_app()
-
-
-if __name__ == "__main__":
-    uvicorn.run(
-        "kv_router.router:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=False,
+    return GenerateResponse(
+        request_id=request_id,
+        selected_node=selected_node,
+        tried_nodes=tried_nodes,
+        uncertainty=uncertainty,
+        routing_scores=ranked_scores,
+        router_metrics=ROUTER_METRICS.snapshot(),
+        upstream_response=upstream_response,
     )

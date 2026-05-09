@@ -22,6 +22,10 @@ router:
   vllm_generate_path: "/generate"
   max_active_requests: 16
 
+rust_scorer:
+  enabled: true
+  url: "http://localhost:9000/score"
+
 uncertainty_estimator:
   type: heuristic
   params:

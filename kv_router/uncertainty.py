@@ -2,123 +2,80 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
-from typing import Dict, List, Protocol, Any
+from abc import ABC, abstractmethod
 
 
-_TOKEN_PATTERN = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+class BaseUncertaintyEstimator(ABC):
+    @abstractmethod
+    def estimate(self, prompt: str, temperature: float) -> float:
+        raise NotImplementedError
 
 
-def clamp01(value: float) -> float:
-    return max(0.0, min(1.0, value))
+class HeuristicUncertaintyEstimator(BaseUncertaintyEstimator):
+    def __init__(
+        self,
+        length_weight: float = 0.35,
+        temperature_weight: float = 0.35,
+        rare_token_weight: float = 0.20,
+        punctuation_weight: float = 0.05,
+        long_token_weight: float = 0.05,
+    ) -> None:
+        self.length_weight = length_weight
+        self.temperature_weight = temperature_weight
+        self.rare_token_weight = rare_token_weight
+        self.punctuation_weight = punctuation_weight
+        self.long_token_weight = long_token_weight
 
-
-def simple_tokenize(text: str) -> List[str]:
-    if not text:
-        return []
-    return _TOKEN_PATTERN.findall(text)
-
-
-def extract_features(prompt: str, temperature: float) -> Dict[str, float]:
-    tokens = simple_tokenize(prompt)
-    token_count = len(tokens)
-
-    if token_count == 0:
-        rare_token_ratio = 0.0
-        punctuation_ratio = 0.0
-        long_token_ratio = 0.0
-    else:
-        rare_like_tokens = [
-            t for t in tokens
-            if (
-                any(ch.isdigit() for ch in t)
-                or "_" in t
-                or len(t) > 12
-                or not t.isascii()
-                or any(ch in "{}[]()<>=/*+-_" for ch in t)
-            )
-        ]
-        punctuation_like = [t for t in tokens if len(t) == 1 and not t.isalnum()]
+    def estimate(self, prompt: str, temperature: float) -> float:
+        tokens = prompt.split()
+        token_count = max(1, len(tokens))
         long_tokens = [t for t in tokens if len(t) >= 10]
+        punctuation_count = len(re.findall(r"[,:;!?()\-]", prompt))
+        rare_like = [t for t in tokens if any(ch.isdigit() for ch in t) or "/" in t or "_" in t]
 
-        rare_token_ratio = len(rare_like_tokens) / token_count
-        punctuation_ratio = len(punctuation_like) / token_count
-        long_token_ratio = len(long_tokens) / token_count
+        length_feature = min(1.0, token_count / 64.0)
+        temperature_feature = min(1.0, max(0.0, temperature))
+        rare_feature = min(1.0, len(rare_like) / token_count)
+        punctuation_feature = min(1.0, punctuation_count / max(1, len(prompt)))
+        long_token_feature = min(1.0, len(long_tokens) / token_count)
 
-    prompt_length_chars = len(prompt)
-    normalized_length = min(prompt_length_chars / 4000.0, 1.0)
-    normalized_temperature = clamp01(temperature / 2.0)
-
-    return {
-        "prompt_length_chars": float(prompt_length_chars),
-        "token_count": float(token_count),
-        "normalized_length": normalized_length,
-        "normalized_temperature": normalized_temperature,
-        "rare_token_ratio": rare_token_ratio,
-        "punctuation_ratio": punctuation_ratio,
-        "long_token_ratio": long_token_ratio,
-    }
-
-
-class UncertaintyEstimator(Protocol):
-    def estimate(self, prompt: str, temperature: float) -> float:
-        ...
-
-
-@dataclass
-class HeuristicUncertaintyEstimator:
-    length_weight: float = 0.35
-    temperature_weight: float = 0.35
-    rare_token_weight: float = 0.20
-    punctuation_weight: float = 0.05
-    long_token_weight: float = 0.05
-
-    def estimate(self, prompt: str, temperature: float) -> float:
-        features = extract_features(prompt, temperature)
         score = (
-            self.length_weight * features["normalized_length"]
-            + self.temperature_weight * features["normalized_temperature"]
-            + self.rare_token_weight * features["rare_token_ratio"]
-            + self.punctuation_weight * features["punctuation_ratio"]
-            + self.long_token_weight * features["long_token_ratio"]
+            self.length_weight * length_feature
+            + self.temperature_weight * temperature_feature
+            + self.rare_token_weight * rare_feature
+            + self.punctuation_weight * punctuation_feature
+            + self.long_token_weight * long_token_feature
         )
-        return clamp01(score)
+        return round(max(0.0, min(1.0, score)), 6)
 
 
-@dataclass
-class LogisticRegressionUncertaintyEstimator:
-    bias: float
-    coefficients: Dict[str, float]
+class LogisticUncertaintyEstimator(BaseUncertaintyEstimator):
+    def __init__(self, bias: float = -1.0, w_len: float = 1.0, w_temp: float = 1.0, w_rare: float = 0.5) -> None:
+        self.bias = bias
+        self.w_len = w_len
+        self.w_temp = w_temp
+        self.w_rare = w_rare
 
     def estimate(self, prompt: str, temperature: float) -> float:
-        features = extract_features(prompt, temperature)
-        logit = self.bias
-        for feature_name, feature_value in features.items():
-            logit += self.coefficients.get(feature_name, 0.0) * feature_value
-        probability = 1.0 / (1.0 + math.exp(-logit))
-        return clamp01(probability)
+        tokens = prompt.split()
+        token_count = max(1, len(tokens))
+        rare_like = [t for t in tokens if any(ch.isdigit() for ch in t) or "/" in t or "_" in t]
 
-
-def build_uncertainty_estimator(config: Dict[str, Any]) -> UncertaintyEstimator:
-    estimator_type = str(config.get("type", "heuristic")).strip().lower()
-    params = config.get("params", {}) or {}
-
-    if estimator_type == "heuristic":
-        return HeuristicUncertaintyEstimator(
-            length_weight=float(params.get("length_weight", 0.35)),
-            temperature_weight=float(params.get("temperature_weight", 0.35)),
-            rare_token_weight=float(params.get("rare_token_weight", 0.20)),
-            punctuation_weight=float(params.get("punctuation_weight", 0.05)),
-            long_token_weight=float(params.get("long_token_weight", 0.05)),
+        x = (
+            self.bias
+            + self.w_len * min(1.0, token_count / 64.0)
+            + self.w_temp * min(1.0, max(0.0, temperature))
+            + self.w_rare * min(1.0, len(rare_like) / token_count)
         )
+        p = 1.0 / (1.0 + math.exp(-x))
+        return round(max(0.0, min(1.0, p)), 6)
 
-    if estimator_type in {"logistic", "logistic_regression"}:
-        return LogisticRegressionUncertaintyEstimator(
-            bias=float(params.get("bias", -1.0)),
-            coefficients={
-                str(k): float(v)
-                for k, v in (params.get("coefficients", {}) or {}).items()
-            },
-        )
 
-    raise ValueError(f"Unsupported uncertainty estimator type: {estimator_type!r}")
+def build_uncertainty_estimator(config: dict) -> BaseUncertaintyEstimator:
+    estimator_cfg = config.get("uncertainty_estimator", {})
+    estimator_type = estimator_cfg.get("type", "heuristic")
+    params = estimator_cfg.get("params", {})
+
+    if estimator_type == "logistic":
+        return LogisticUncertaintyEstimator(**params)
+    return HeuristicUncertaintyEstimator(**params)

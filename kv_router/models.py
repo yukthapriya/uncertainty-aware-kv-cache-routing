@@ -1,50 +1,45 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
+
+
+RoutingStrategy = Literal["kv_aware", "least_loaded", "round_robin"]
 
 
 class GenerateRequest(BaseModel):
-    """Incoming generation request for the router."""
-
-    prompt: str = Field(..., min_length=1)
-    max_tokens: int = Field(..., gt=0, le=8192)
-    temperature: float = Field(0.7, ge=0.0, le=2.0)
-    stream: bool = Field(False)
-
-    @field_validator("prompt")
-    @classmethod
-    def validate_prompt(cls, value: str) -> str:
-        stripped = value.strip()
-        if not stripped:
-            raise ValueError("prompt must not be empty or whitespace only")
-        return stripped
+    prompt: str
+    max_tokens: int = 64
+    temperature: float = 0.8
+    stream: bool = False
+    session_id: str | None = None
+    routing_strategy: RoutingStrategy = "kv_aware"
 
 
 class NodeMetrics(BaseModel):
-    kv_used_mb: int = 0
-    kv_capacity_mb: int = 0
-    active_requests: int = 0
+    kv_used_mb: int
+    kv_capacity_mb: int
+    active_requests: int
 
 
-class NodeInfo(BaseModel):
+class NodeState(BaseModel):
     url: str
-    metrics: NodeMetrics
-    last_updated_ts: Optional[float] = None
-    last_error: Optional[str] = None
+    metrics: NodeMetrics | None = None
+    last_updated_ts: float | None = None
+    last_error: str | None = None
     healthy: bool = False
     stale: bool = True
 
 
 class RoutingWeights(BaseModel):
     alpha: float = 1.0
-    beta: float = 0.2
-    gamma: float = 0.8
+    beta: float = 0.25
+    gamma: float = 1.0
     delta: float = 2.0
 
 
-class RoutingBreakdown(BaseModel):
+class RoutingScoreBreakdown(BaseModel):
     node_url: str
     free_kv_ratio: float
     cache_pressure: float
@@ -56,11 +51,42 @@ class RoutingBreakdown(BaseModel):
     stale: bool
 
 
+class RustScorerNodeInput(BaseModel):
+    node_url: str
+    kv_used_mb: int
+    kv_capacity_mb: int
+    active_requests: int
+    healthy: bool
+    stale: bool
+
+
+class RustScorerRequest(BaseModel):
+    uncertainty: float
+    max_active_requests: int
+    weights: RoutingWeights
+    nodes: list[RustScorerNodeInput]
+
+
+class RustScorerResponse(BaseModel):
+    ranked_nodes: list[RoutingScoreBreakdown]
+
+
+class RouterMetricsSnapshot(BaseModel):
+    uptime_seconds: float
+    requests_total: int
+    requests_failed: int
+    fallbacks_total: int
+    selected_per_node: dict[str, int]
+    avg_uncertainty: float
+    avg_router_latency_ms: float
+    avg_upstream_latency_ms: float
+
+
 class GenerateResponse(BaseModel):
     request_id: str
     selected_node: str
-    tried_nodes: List[str]
+    tried_nodes: list[str]
     uncertainty: float
-    routing_scores: List[RoutingBreakdown]
-    router_metrics: Dict[str, Any]
-    upstream_response: Dict[str, Any]
+    routing_scores: list[RoutingScoreBreakdown]
+    router_metrics: RouterMetricsSnapshot
+    upstream_response: dict[str, Any] = Field(default_factory=dict)
