@@ -1,0 +1,42 @@
+version: "3.9"
+
+services:
+  router:
+    build: .
+    container_name: kv-router
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mock-node-1
+      - mock-node-2
+      - mock-node-3
+
+  mock-node-1:
+    build: .
+    container_name: mock-node-1
+    command: ["uvicorn", "mock_node:app", "--host", "0.0.0.0", "--port", "8101"]
+    environment:
+      NODE_NAME: "mock-node-1"
+      FAILURE_RATE: "0.0"
+    expose:
+      - "8101"
+
+  mock-node-2:
+    build: .
+    container_name: mock-node-2
+    command: ["uvicorn", "mock_node:app", "--host", "0.0.0.0", "--port", "8102"]
+    environment:
+      NODE_NAME: "mock-node-2"
+      FAILURE_RATE: "0.2"
+    expose:
+      - "8102"
+
+  mock-node-3:
+    build: .
+    container_name: mock-node-3
+    command: ["uvicorn", "mock_node:app", "--host", "0.0.0.0", "--port", "8103"]
+    environment:
+      NODE_NAME: "mock-node-3"
+      FAILURE_RATE: "0.0"
+    expose:
+      - "8103"

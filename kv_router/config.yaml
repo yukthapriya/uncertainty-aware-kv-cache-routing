@@ -1,0 +1,32 @@
+nodes:
+  - "http://localhost:8101"
+  - "http://localhost:8102"
+  - "http://localhost:8103"
+
+polling:
+  interval_s: 5
+  stale_after_s: 10
+  degrade_duration_s: 15
+
+timeouts:
+  metrics_request_timeout_s: 2.0
+  forward_request_timeout_s: 30.0
+
+scoring:
+  alpha: 1.0
+  beta: 0.25
+  gamma: 1.0
+  delta: 2.0
+
+router:
+  vllm_generate_path: "/generate"
+  max_active_requests: 16
+
+uncertainty_estimator:
+  type: heuristic
+  params:
+    length_weight: 0.35
+    temperature_weight: 0.35
+    rare_token_weight: 0.20
+    punctuation_weight: 0.05
+    long_token_weight: 0.05
